@@ -28,6 +28,7 @@ router.post("/checkout", asyncHandler(controller.checkout));
 
 router.get("/", asyncHandler(controller.getOrderHistory));
 router.get("/:orderId", asyncHandler(controller.getOrderById));
+router.post("/:orderId/cancel", asyncHandler(controller.cancelOrder));
 router.patch(
   "/:orderId/status",
   authorize("admin", "pharmacist"),

@@ -151,6 +151,7 @@ const AdminDashboard = () => {
   const [summary, setSummary] = useState({
     totals: {
       orders: 0,
+      cancelledOrders: 0,
       medicines: 0,
       users: 0,
       pendingPayments: 0,
@@ -196,6 +197,10 @@ const AdminDashboard = () => {
       {
         label: "Total Orders",
         value: Math.max(toNumber(summary?.totals?.orders, 0), orders.length),
+      },
+      {
+        label: "Total Cancelled Orders",
+        value: toNumber(summary?.totals?.cancelledOrders, 0),
       },
       {
         label: "Total Medicines",

@@ -13,6 +13,7 @@ const ORDER_STATUS = [
   "picked_up",
   "cancelled",
 ];
+const NON_CANCELLABLE_STATUSES = ["picked_up", "cancelled"];
 
 function toNumber(value, defaultValue = 0) {
   const parsed = Number(value);
@@ -179,6 +180,89 @@ function generatePickupSlots(days = 3) {
   }
 
   return slots;
+}
+
+function parsePickupSlotStartTime(label) {
+  const safeLabel = String(label || "").trim();
+  const match = safeLabel.match(/^(\d{1,2}):(\d{2})\s*-/);
+  if (!match) {
+    return null;
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    return null;
+  }
+
+  return { hours, minutes };
+}
+
+function getPickupSlotStartDate(pickupSlot) {
+  const baseDate = new Date(pickupSlot?.date);
+  if (Number.isNaN(baseDate.getTime())) {
+    return null;
+  }
+
+  const startTime = parsePickupSlotStartTime(pickupSlot?.label);
+  if (!startTime) {
+    return null;
+  }
+
+  const slotStart = new Date(baseDate);
+  slotStart.setHours(startTime.hours, startTime.minutes, 0, 0);
+  return slotStart;
+}
+
+function buildCancellationDecision(order, now = new Date()) {
+  const currentStatus = String(order?.status || "").trim();
+  if (NON_CANCELLABLE_STATUSES.includes(currentStatus)) {
+    return {
+      allowed: false,
+      reason: "status_not_cancellable",
+      message: `Order cannot be cancelled when status is ${currentStatus}`,
+    };
+  }
+
+  const slotStart = getPickupSlotStartDate(order?.pickupSlot);
+  if (!slotStart) {
+    return {
+      allowed: false,
+      reason: "invalid_pickup_slot",
+      message: "Order pickup slot is invalid",
+    };
+  }
+
+  if (now >= slotStart) {
+    return {
+      allowed: false,
+      reason: "cutoff_passed",
+      slotStart,
+      message: `Order cannot be cancelled after pickup slot start time (${slotStart.toLocaleString("en-IN")})`,
+    };
+  }
+
+  return { allowed: true, slotStart };
+}
+
+async function applyOrderCancellation({ order, updatedBy, note }) {
+  const previousStatus = order.status;
+  const cancellationRef = `cancel-${order.orderNumber}`;
+
+  if (order.inventoryStatus === "reserved") {
+    await inventoryClient.releaseStock(order.items, cancellationRef);
+    order.inventoryStatus = "released";
+  }
+
+  order.status = "cancelled";
+  order.statusHistory.push({
+    status: "cancelled",
+    updatedBy,
+    note: String(note || "").trim() || "Order cancelled before pickup slot start",
+  });
+
+  await saveOrderSafely(order);
+  await eventPublisher.publishOrderStatusUpdated(order, previousStatus);
 }
 
 async function getOrCreateCart(userId) {
@@ -586,11 +670,26 @@ exports.updateOrderStatus = async (req, res) => {
     return res.status(200).json({ order: formatOrder(order) });
   }
 
-  order.status = nextStatus;
-  if (nextStatus === "cancelled" && order.inventoryStatus === "reserved") {
-    await inventoryClient.releaseStock(order.items, `cancel-${order.orderNumber}`);
-    order.inventoryStatus = "released";
+  if (nextStatus === "cancelled") {
+    const decision = buildCancellationDecision(order, new Date());
+    if (!decision.allowed) {
+      const statusCode = decision.reason === "invalid_pickup_slot" ? 400 : 409;
+      return res.status(statusCode).json({ message: decision.message });
+    }
+
+    await applyOrderCancellation({
+      order,
+      updatedBy: req.user.userId,
+      note,
+    });
+
+    return res.status(200).json({
+      message: "Order status updated",
+      order: formatOrder(order),
+    });
   }
+
+  order.status = nextStatus;
 
   order.statusHistory.push({
     status: nextStatus,
@@ -603,6 +702,42 @@ exports.updateOrderStatus = async (req, res) => {
 
   return res.status(200).json({
     message: "Order status updated",
+    order: formatOrder(order),
+  });
+};
+
+exports.cancelOrder = async (req, res) => {
+  const note = String(req.body?.note || "").trim();
+  const order = await Order.findOne({
+    _id: req.params.orderId,
+    userId: req.user.userId,
+  });
+
+  if (!order) {
+    return res.status(404).json({ message: "Order not found" });
+  }
+
+  if (order.status === "cancelled") {
+    return res.status(200).json({
+      message: "Order already cancelled",
+      order: formatOrder(order),
+    });
+  }
+
+  const decision = buildCancellationDecision(order, new Date());
+  if (!decision.allowed) {
+    const statusCode = decision.reason === "invalid_pickup_slot" ? 400 : 409;
+    return res.status(statusCode).json({ message: decision.message });
+  }
+
+  await applyOrderCancellation({
+    order,
+    updatedBy: req.user.userId,
+    note,
+  });
+
+  return res.status(200).json({
+    message: "Order cancelled successfully",
     order: formatOrder(order),
   });
 };

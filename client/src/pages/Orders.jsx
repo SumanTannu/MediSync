@@ -1,7 +1,7 @@
 import React, { useContext, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { fetchOrders } from "../services/orderService";
+import { cancelOrder, fetchOrders } from "../services/orderService";
 import { fetchPaymentsByOrder } from "../services/paymentService";
 import MedicineBrowseBar from "../components/common/MedicineBrowseBar";
 import { getMedicineById } from "../services/inventoryService";
@@ -14,6 +14,68 @@ const formatMoney = (value) => `Rs ${Number(value || 0).toFixed(2)}`;
 const formatDateTime = (value) => (value ? new Date(value).toLocaleString() : "N/A");
 const formatDateOnly = (value) => (value ? new Date(value).toLocaleDateString() : "N/A");
 const normalizePaymentStatus = (value) => String(value || "").trim().toLowerCase();
+
+const parsePickupSlotStartTime = (label) => {
+  const safeLabel = String(label || "").trim();
+  const match = safeLabel.match(/^(\d{1,2}):(\d{2})\s*-/);
+  if (!match) {
+    return null;
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    return null;
+  }
+
+  return { hours, minutes };
+};
+
+const getPickupSlotStartDate = (pickupSlot) => {
+  const date = new Date(pickupSlot?.date);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const startTime = parsePickupSlotStartTime(pickupSlot?.label);
+  if (!startTime) {
+    return null;
+  }
+
+  const slotStart = new Date(date);
+  slotStart.setHours(startTime.hours, startTime.minutes, 0, 0);
+  return slotStart;
+};
+
+const getCancellationEligibility = (order) => {
+  const status = String(order?.status || "").trim().toLowerCase();
+  if (["cancelled", "picked_up"].includes(status)) {
+    return {
+      canCancel: false,
+      reason: `Order cannot be cancelled when status is ${status}`,
+      slotStart: null,
+    };
+  }
+
+  const slotStart = getPickupSlotStartDate(order?.pickupSlot);
+  if (!slotStart) {
+    return {
+      canCancel: false,
+      reason: "Pickup slot is unavailable for cancellation checks",
+      slotStart: null,
+    };
+  }
+
+  if (Date.now() >= slotStart.getTime()) {
+    return {
+      canCancel: false,
+      reason: `Cancellation window closed at ${slotStart.toLocaleString()}`,
+      slotStart,
+    };
+  }
+
+  return { canCancel: true, reason: "", slotStart };
+};
 
 const reconcilePaidOrders = async (orderItems) => {
   const unpaidOrders = orderItems.filter(
@@ -107,6 +169,7 @@ const Orders = () => {
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [cancellingOrderId, setCancellingOrderId] = useState("");
   const [expandedOrderId, setExpandedOrderId] = useState(null);
   const [reorderingOrderId, setReorderingOrderId] = useState(null);
   const [ratingModalOrder, setRatingModalOrder] = useState(null);
@@ -286,6 +349,34 @@ const Orders = () => {
     navigate(`/payments/${order.id}`, { state: { order } });
   };
 
+  const onCancelOrder = async (event, order) => {
+    event.stopPropagation();
+
+    const eligibility = getCancellationEligibility(order);
+    if (!eligibility.canCancel) {
+      toast.error(eligibility.reason || "Order cannot be cancelled");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Cancel this order? You can cancel only before pickup start (${eligibility.slotStart.toLocaleString()}).`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setCancellingOrderId(order.id);
+    try {
+      const updatedOrder = await cancelOrder(order.id);
+      setOrders((current) => current.map((item) => (item.id === updatedOrder?.id ? updatedOrder : item)));
+      toast.success("Order cancelled successfully");
+    } catch (err) {
+      toast.error(err.response?.data?.message || "Unable to cancel order");
+    } finally {
+      setCancellingOrderId("");
+    }
+  };
+
   const onCloseRatingModal = () => {
     setRatingModalOrder(null);
     setRatingDraft({
@@ -378,6 +469,8 @@ const Orders = () => {
           );
           const previewItems = order.items.slice(0, ORDER_PREVIEW_LIMIT);
           const hiddenItemCount = Math.max(0, order.items.length - ORDER_PREVIEW_LIMIT);
+          const cancellation = getCancellationEligibility(order);
+          const isCancelling = cancellingOrderId === order.id;
 
           return (
             <article
@@ -460,6 +553,16 @@ const Orders = () => {
                 >
                   {reorderingOrderId === order.id ? "Adding..." : "Order Again"}
                 </button>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={!cancellation.canCancel || isCancelling}
+                  onClick={(event) => onCancelOrder(event, order)}
+                  style={{ padding: "8px 12px" }}
+                  title={cancellation.canCancel ? "Cancel this order" : cancellation.reason}
+                >
+                  {isCancelling ? "Cancelling..." : "Cancel Order"}
+                </button>
               </div>
 
               {isExpanded ? (
@@ -477,6 +580,11 @@ const Orders = () => {
                         <strong>Pickup:</strong> {formatDateOnly(order.pickupSlot?.date)} |{" "}
                         {order.pickupSlot?.label || "N/A"}
                       </p>
+                      {!cancellation.canCancel ? (
+                        <p className="order-info-line muted" style={{ marginTop: "4px" }}>
+                          <strong>Cancellation:</strong> {cancellation.reason}
+                        </p>
+                      ) : null}
                       <p className="order-info-line">
                         <strong>Address:</strong> {order.address || "N/A"}
                       </p>

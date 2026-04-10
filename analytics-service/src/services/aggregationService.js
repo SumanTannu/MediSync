@@ -15,6 +15,12 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+const NON_CANCELLED_MATCH = { status: { $ne: "cancelled" } };
+const NON_CANCELLED_PAID_MATCH = {
+  paymentStatus: "paid",
+  status: { $ne: "cancelled" },
+};
+
 async function handleOrderCreated(payload, eventType, emittedAt) {
   const orderId = String(payload.orderId || "").trim();
   if (!orderId) {
@@ -213,6 +219,7 @@ async function fetchTotalMedicines() {
 async function getSummary() {
   const [
     totalOrders,
+    cancelledOrders,
     revenueResult,
     pendingPayments,
     totalUsersResult,
@@ -222,13 +229,15 @@ async function getSummary() {
     totalMedicines,
   ] = await Promise.all([
     Report.countDocuments(),
+    Report.countDocuments({ status: "cancelled" }),
     Report.aggregate([
-      { $match: { paymentStatus: "paid" } },
+      { $match: NON_CANCELLED_PAID_MATCH },
       { $group: { _id: null, revenue: { $sum: "$totalAmount" } } },
     ]),
-    Report.countDocuments({ paymentStatus: "pending" }),
+    Report.countDocuments({ paymentStatus: "pending", ...NON_CANCELLED_MATCH }),
     Report.aggregate([{ $group: { _id: "$userId" } }, { $count: "total" }]),
     Report.aggregate([
+      { $match: NON_CANCELLED_MATCH },
       { $unwind: "$items" },
       {
         $group: {
@@ -242,7 +251,7 @@ async function getSummary() {
       { $limit: 5 },
     ]),
     Report.aggregate([
-      { $match: { paymentStatus: "paid" } },
+      { $match: NON_CANCELLED_PAID_MATCH },
       {
         $group: {
           _id: {
@@ -259,13 +268,23 @@ async function getSummary() {
       { $limit: 14 },
     ]),
     Report.aggregate([
+      { $match: NON_CANCELLED_MATCH },
       {
         $group: {
           _id: "$userId",
           totalOrders: { $sum: 1 },
           totalSpend: {
             $sum: {
-              $cond: [{ $eq: ["$paymentStatus", "paid"] }, "$totalAmount", 0],
+              $cond: [
+                {
+                  $and: [
+                    { $eq: ["$paymentStatus", "paid"] },
+                    { $ne: ["$status", "cancelled"] },
+                  ],
+                },
+                "$totalAmount",
+                0,
+              ],
             },
           },
           lastOrderAt: { $max: "$placedAt" },
@@ -280,6 +299,7 @@ async function getSummary() {
   return {
     totals: {
       orders: totalOrders,
+      cancelledOrders,
       medicines: totalMedicines,
       users: totalUsersResult[0]?.total || 0,
       pendingPayments,

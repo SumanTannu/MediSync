@@ -58,6 +58,7 @@ Authenticated user routes:
 - cart CRUD
 - checkout
 - own order history/details
+- order cancellation before pickup slot start
 
 Privileged route:
 - `PATCH /:orderId/status` requires `admin` or `pharmacist`
@@ -394,13 +395,45 @@ Behavior:
 - if status changes to `cancelled` while inventory is reserved:
   - releases stock via inventory service
   - sets `inventoryStatus = released`
+- cancellation is allowed only before pickup slot start time (for example slot `09:00 - 11:00` cannot be cancelled at/after `09:00` on slot date)
 - appends status history entry
 - publishes `order.status_updated`
 
 Possible errors:
 - `400` invalid status
 - `404` order not found
+- `409` cancellation attempted after pickup slot start or for non-cancellable status
 - `409` optimistic concurrency conflict
+
+## `POST /:orderId/cancel`
+
+Cancel an order as the order owner.
+
+Auth: Required
+
+Rules:
+- only the order owner can cancel through this endpoint
+- order must be cancelled before pickup slot start time
+- orders in `picked_up` or already `cancelled` are not cancellable
+
+Behavior:
+- sets order status to `cancelled`
+- if inventory is still reserved, releases stock and marks `inventoryStatus = released`
+- appends status history entry
+- publishes `order.status_updated` for analytics/payment consumers
+
+Success response (`200`):
+
+```json
+{
+  "message": "Order cancelled successfully",
+  "order": {}
+}
+```
+
+Possible errors:
+- `404` order not found
+- `409` cancellation attempted after slot start or invalid order status
 
 ## `PATCH /internal/:orderId/payment-status`
 
